@@ -158,6 +158,53 @@ def safe_filename(name: str) -> str:
     return cleaned or "file"
 
 
+def copy_artifact_range(
+    source_session_id: str,
+    start: int,
+    end: int,
+    *,
+    expected_total: int | None = None,
+) -> str:
+    """把已完成会话成品的 [start, end) 字节段复制到 tmp 下的新临时文件。
+
+    用于 copy-chunk：来源只有 completed 成品可复制。读取前核对成品总大小
+    （调用方可传 expected_total 二次确认）与实际可读长度，缺字节立即报错，
+    绝不产生“长度正确但内容残缺”的分片。目标文件先 fsync 再关闭，
+    防止掉页后被登记为损坏分片。返回临时文件路径；失败时自行清理。
+    """
+    src = artifact_path(source_session_id)
+    length = end - start
+    tmp = new_temp_file()
+    try:
+        with src.open("rb") as fh:
+            actual_size = fh.seek(0, os.SEEK_END)
+            if expected_total is not None and actual_size != expected_total:
+                raise ValueError(
+                    f"artifact size {actual_size} != expected {expected_total}"
+                )
+            if end > actual_size:
+                raise ValueError(
+                    f"range [{start},{end}) exceeds artifact size {actual_size}"
+                )
+            fh.seek(start)
+            remaining = length
+            with tmp.open("wb") as out:
+                while remaining > 0:
+                    block = fh.read(min(1024 * 1024, remaining))
+                    if not block:
+                        raise ValueError(
+                            f"artifact truncated: wanted {length} bytes at {start}"
+                        )
+                    out.write(block)
+                    remaining -= len(block)
+                out.flush()
+                os.fsync(out.fileno())
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    return str(tmp)
+
+
 def assemble_artifact(
     session_id: str, chunks: Sequence[tuple[int, int]], total_size: int
 ) -> tuple[str, str]:

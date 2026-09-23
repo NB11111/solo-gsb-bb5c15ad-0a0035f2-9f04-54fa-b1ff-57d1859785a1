@@ -88,6 +88,37 @@ class ChunkResponse(BaseModel):
     expires_at: str
 
 
+class CopyChunkRequest(BaseModel):
+    """服务端分片复制：把来源已完成会话成品的一段复制为本会话的一个分片。"""
+
+    source_session_id: str = Field(
+        ..., description="已完成（completed 且成品存在）的来源会话 ID"
+    )
+    source_start: int = Field(
+        ..., ge=0, description="来源起始偏移（含），半开区间 [source_start, source_end)"
+    )
+    source_end: int = Field(
+        ..., ge=0, description="来源结束偏移（不含）"
+    )
+    dest_start: int = Field(..., ge=0, description="目标分片起始偏移（含）")
+
+    @field_validator("source_session_id")
+    @classmethod
+    def _validate_source_id(cls, value: str) -> str:
+        value = value.strip()
+        if not value:
+            raise ValueError("source_session_id must not be empty")
+        return value
+
+    @field_validator("source_end")
+    @classmethod
+    def _validate_source_range(cls, value: int, info) -> int:
+        start = info.data.get("source_start")
+        if start is not None and value <= start:
+            raise ValueError("invalid source range: require source_start < source_end")
+        return value
+
+
 # ---------------------------------------------------------------------------
 # 受控下载票据
 # ---------------------------------------------------------------------------

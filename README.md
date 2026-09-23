@@ -2,6 +2,8 @@
 
 面向弱网客户端的分片上传/断点续传服务：客户端先创建上传会话，再按**任意顺序**提交带起止偏移的二进制分片；服务端拒绝越界或与已收区间重叠的分片，并通过状态接口返回缺失区间。仅当分片**完整覆盖整个文件**且整文件 **SHA-256 校验通过**时才原子完成并开放下载——任何失败都不会产生可下载成品。
 
+除客户端直传分片（`PUT /sessions/{id}/chunks`）外，还支持**服务端分片复制** `POST /sessions/{id}/copy-chunk`：给出一个已完成的来源会话与字节区间，服务端直接把该段成品复制为目标会话的一个分片，弱网客户端无需重新上传相同内容。
+
 创建会话支持**幂等键**：`POST /sessions` 可携带 `Idempotency-Key` 头，首次响应丢失或并发重试时返回同一会话，不会重复建会话（详见下文「创建上传会话」）。
 
 完成后的文件支持两类下载：
@@ -130,7 +132,57 @@ curl -X PUT \
 
 返回当前累计字节数与剩余 `missing_ranges`。并发提交同一区间时只有一个成功，其余得到 `409`。
 
-### 3. 查询状态 / 缺失区间
+### 3. 服务端复制分片（copy-chunk）
+
+```http
+POST /api/v1/sessions/{session_id}/copy-chunk
+Content-Type: application/json
+
+{
+  "source_session_id": "e3a886dc...",
+  "source_start": 1048576,
+  "source_end": 5242880,
+  "dest_start": 0
+}
+```
+
+把**已完成来源会话**成品的半开区间 `[source_start, source_end)` 在服务端直接复制为目标会话的一个分片，落在目标 `[dest_start, dest_start + source_end - source_start)`。请求体很小、不需要重新上传字节，响应与普通分片提交（`PUT .../chunks`）**完全一致**（`ChunkResponse`：`received` / `bytes_received` / `missing_ranges` / `fully_received` / `expires_at`）。复制只搬运字节，不改变校验规则——之后仍须区间完整覆盖并通过整文件 SHA-256 才能 `complete`。
+
+前置校验（任一不过即拒绝，**不登记分片、不增加已收字节**）：
+
+- 来源会话存在且状态为 `completed`，且成品文件确实在盘：未完成（`uploading`）→ `409 {"error":"source session is not completed"}`，已放弃/过期 → `409`，不存在 → `404`，成品缺失 → `409 {"error":"source completed artifact is missing"}`；
+- `0 <= source_start < source_end`（半开区间，空区间 `422`），且 `source_end <= 来源 total_size`，越界 → `400`；
+- 目标会话处于 `uploading`（未过期/未放弃/未完成，完成态 → `409`，失效 → `410`，不存在 → `404`）；
+- `dest_start >= 0` 且 `dest_start + (source_end - source_start) <= 目标 total_size`，越界 → `400`；
+- 单片大小不得超过 `MAX_CHUNK_BYTES`，超限 → `413`；
+- 目标区间与已收区间不得**重叠**（相邻允许），重叠 → `409`。
+
+并发与失败语义：
+
+- 复制期间同时锁定来源与目标会话，锁一律按会话 ID 字典序获取——两个会话互相反向复制也不会死锁；持锁期间来源不会被并发 `DELETE` 删除、目标不会被并发放弃或过期；
+- 复制先写入 `tmp/` 临时文件（含 fsync），在单个 `BEGIN IMMEDIATE` 事务内对目标状态、边界与重叠做**二次校验**后才移动分片并登记；临时文件 IO 失败、成品残缺或数据库失败都会回滚并清理临时/分片文件，**绝不留下已登记的损坏分片或虚增的已收字节**；
+- 复制成功只滑动**目标**会话的 TTL；来源会话与成品完全不受影响。
+
+curl 示例（假设来源会话 `$SRC` 已完成）：
+
+```bash
+curl -X POST "http://localhost:8000/api/v1/sessions/$SID/copy-chunk" \
+  -H "Content-Type: application/json" \
+  -d '{"source_session_id":"'"$SRC"'","source_start":1048576,"source_end":5242880,"dest_start":0}'
+```
+
+```json
+{
+  "session_id": "目标会话 ID",
+  "received": {"start": 0, "end": 4194304},
+  "bytes_received": 4194304,
+  "missing_ranges": [{"start": 4194304, "end": 104857600}],
+  "fully_received": false,
+  "expires_at": "2026-09-21T12:00:00Z"
+}
+```
+
+### 4. 查询状态 / 缺失区间
 
 ```http
 GET /api/v1/sessions/{session_id}
@@ -155,7 +207,7 @@ GET /api/v1/sessions/{session_id}
 
 客户端断连恢复时：先查状态，按 `missing_ranges` 补传即可。
 
-### 4. 原子完成
+### 5. 原子完成
 
 ```http
 POST /api/v1/sessions/{session_id}/complete
@@ -165,7 +217,7 @@ POST /api/v1/sessions/{session_id}/complete
 - 已覆盖但 SHA-256 不匹配 → `422`（返回 `expected`/`actual`），会话保持 `uploading`，客户端可修正后重试或放弃；不产生成品
 - 全部通过 → 拼装临时文件 → 校验 → 与状态翻转在同一事务窗口内**原子发布**，状态变为 `completed`，开放下载。完成接口幂等。
 
-### 5. 下载成品（会话下载，不计数）
+### 6. 下载成品（会话下载，不计数）
 
 ```http
 GET /api/v1/sessions/{session_id}/download
@@ -173,7 +225,7 @@ GET /api/v1/sessions/{session_id}/download
 
 仅 `completed` 会话返回 `200`（支持 `Range` 断点下载续传）；其他状态一律 `404`，失败流程中不存在任何可下载产物。该接口保持不变、不校验票据、不限制次数。
 
-### 6. 签发受控下载票据
+### 7. 签发受控下载票据
 
 ```http
 POST /api/v1/sessions/{session_id}/tickets
@@ -205,7 +257,7 @@ Content-Type: application/json
 
 `ticket` 即下载凭证（`<ticket_id>.<随机串>`，URL-safe），把它拼到下载路径即可分发；请像对待密码一样保管它，票据 URL 可能出现在代理/访问日志中。
 
-### 7. 凭票下载（原子计数，支持 Range）
+### 8. 凭票下载（原子计数，支持 Range）
 
 ```http
 GET /api/v1/tickets/{ticket}/download
@@ -226,7 +278,7 @@ Range: bytes=100-199
 - 次数用尽后返回 `429 {"detail":{"error":"ticket download limit reached"}}`。
 - 票据独立计数，互不影响；删除所属会话会级联删除其票据。
 
-### 8. 撤销票据
+### 9. 撤销票据
 
 ```http
 POST /api/v1/tickets/{ticket}/revoke
@@ -234,7 +286,7 @@ POST /api/v1/tickets/{ticket}/revoke
 
 幂等：已撤销再次调用仍返回 `200` 与票据元数据（`revoked: true`，剩余次数原样保留）。票据不存在/伪造返回 `404`。撤销后任何凭票下载立即得到 `403`，且不扣减。
 
-### 9. 放弃会话
+### 10. 放弃会话
 
 ```http
 DELETE /api/v1/sessions/{session_id}
@@ -242,7 +294,7 @@ DELETE /api/v1/sessions/{session_id}
 
 幂等，返回 `204`：删除会话记录、已收分片与成品。
 
-### 10. 存储汇总（运维只读）
+### 11. 存储汇总（运维只读）
 
 ```http
 GET /api/v1/storage/summary
@@ -294,6 +346,7 @@ GET /api/v1/storage/summary
 - 恢复后先调 `GET /sessions/{id}`，只补 `missing_ranges`。
 - 可选为每个分片附带 `X-Chunk-SHA256` 头：弱网/代理导致的分片片内损坏在提交时即可被 `422` 发现并就地重传，不必等到最后整文件校验失败后放弃整个会话。
 - 全部补齐后调 `complete`；`422 sha256 mismatch` 说明有分片内容损坏，应放弃会话后重新创建上传。
+- 需要重新上传与某个**已完成会话**相同的字节段时，优先用 `POST /sessions/{id}/copy-chunk` 让服务端本地复制（例如大文件的公共头部/尾部），省去弱网重传；来源未完成或成品已缺失时会被拒绝。
 
 ---
 
@@ -308,4 +361,4 @@ DATA_DIR=./data uvicorn app.main:app --reload --port 8000
 python3 -m pytest -q
 ```
 
-测试覆盖：乱序完整上传与下载、越界/重叠/长度不符拒绝、缺失区间计算、并发重叠竞态（仅一个成功）、SHA-256 不匹配、空文件、放弃、过期清理与未知会话；受控票据覆盖参数边界、只存哈希、完整/Range 下载计数、耗尽 `429`、过期 `410`、撤销 `403`、伪造票据 `404`、30 并发不突破上限、票据相互独立、删除会话级联失效；幂等键覆盖同键重放返回同一会话、同键不同请求 `409`、键格式边界（1/128 字符、空、空格、非 ASCII）、只存哈希、10 并发同键重试只建一个会话、8 并发同键不同请求恰一个成功、删除会话级联删除键记录，以及 v1/v2 老库自动迁移到最新结构。`X-Chunk-SHA256` 覆盖匹配摘要接受（小写/大写/`sha256:` 前缀）、摘要不符 `422`（不落盘、不登记、可重传后正常完成整文件校验）、头格式错误 `400`（读体前拒绝）、长度错误优先于摘要错误、无头行为不变，以及带头/不带头分片混合上传。
+测试覆盖：乱序完整上传与下载、越界/重叠/长度不符拒绝、缺失区间计算、并发重叠竞态（仅一个成功）、SHA-256 不匹配、空文件、放弃、过期清理与未知会话；受控票据覆盖参数边界、只存哈希、完整/Range 下载计数、耗尽 `429`、过期 `410`、撤销 `403`、伪造票据 `404`、30 并发不突破上限、票据相互独立、删除会话级联失效；幂等键覆盖同键重放返回同一会话、同键不同请求 `409`、键格式边界（1/128 字符、空、空格、非 ASCII）、只存哈希、10 并发同键重试只建一个会话、8 并发同键不同请求恰一个成功、删除会话级联删除键记录，以及 v1/v2 老库自动迁移到最新结构。`X-Chunk-SHA256` 覆盖匹配摘要接受（小写/大写/`sha256:` 前缀）、摘要不符 `422`（不落盘、不登记、可重传后正常完成整文件校验）、头格式错误 `400`（读体前拒绝）、长度错误优先于摘要错误、无头行为不变，以及带头/不带头分片混合上传。`copy-chunk` 覆盖区间复制成功并正常完成整文件校验、部分区间复制、来源未完成/不存在/已放弃/成品缺失拒绝、来源区间与目标边界越界、单片超限 `413`、与已收区间重叠 `409`、失败不登记不增字节、复制期间来源删除/目标放弃被锁阻塞、两会话反向并发复制无死锁。
