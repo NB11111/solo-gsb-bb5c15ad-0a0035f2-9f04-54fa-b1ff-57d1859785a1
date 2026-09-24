@@ -4,6 +4,7 @@
   POST   /sessions                      创建上传会话（可选 Idempotency-Key 幂等创建）
   GET    /sessions/{id}                 查询状态与缺失区间
   PUT    /sessions/{id}/chunks          提交二进制分片（?start=&end=，半开区间；可选 X-Chunk-SHA256 逐片校验）
+  POST   /sessions/{id}/copy-chunk      从已完成来源会话的成品服务端复制一段为目标会话分片
   POST   /sessions/{id}/complete        原子完成（区间全覆盖 + SHA-256 校验）
   DELETE /sessions/{id}                 放弃会话
   GET    /sessions/{id}/download        会话下载（原有接口，不计数）
@@ -370,18 +371,23 @@ def _commit_chunk(session_id: str, start: int, end: int, tmp_file: str) -> dict:
             tmp_path.unlink(missing_ok=True)
             raise
 
-        fresh = db.get_conn().execute(
-            "SELECT * FROM upload_sessions WHERE id = ?", (session_id,)
-        ).fetchone()
-        payload = _session_payload(fresh)
-        return {
-            "session_id": session_id,
-            "received": {"start": start, "end": end},
-            "bytes_received": payload["bytes_received"],
-            "missing_ranges": payload["missing_ranges"],
-            "fully_received": payload["fully_received"],
-            "expires_at": payload["expires_at"],
-        }
+    return _chunk_accepted_payload(session_id, start, end)
+
+
+def _chunk_accepted_payload(session_id: str, start: int, end: int) -> dict:
+    """分片登记成功后的统一响应体（PUT 分片与 copy-chunk 共用同一形态）。"""
+    fresh = db.get_conn().execute(
+        "SELECT * FROM upload_sessions WHERE id = ?", (session_id,)
+    ).fetchone()
+    payload = _session_payload(fresh)
+    return {
+        "session_id": session_id,
+        "received": {"start": start, "end": end},
+        "bytes_received": payload["bytes_received"],
+        "missing_ranges": payload["missing_ranges"],
+        "fully_received": payload["fully_received"],
+        "expires_at": payload["expires_at"],
+    }
 
 
 @app.put(
@@ -489,6 +495,224 @@ async def put_chunk(
             )
 
     return await run_sync(_commit_chunk, session_id, start, end, str(tmp))
+
+
+# ---------------------------------------------------------------------------
+# 服务端复制分片：从已完成来源会话的成品复制一段到目标会话
+#
+# 与 PUT 分片的登记规则完全一致（同一校验、同一响应、同一 chunks 表），
+# 只是字节来源从客户端请求体换成来源成品文件。流程分两段：
+#   1. 同时按 ID 定序持有“来源 + 目标”两把会话锁，完成来源资格、
+#      来源区间、目标边界、单片大小、与已收区间重叠的全部预校验，
+#      然后流式复制到临时文件；复制期间来源无法被放弃删除、目标无法被放弃。
+#   2. 在单个 BEGIN IMMEDIATE 事务中二次校验后移动临时文件并登记，
+#      与 _commit_chunk 同样的失败清理：任何异常都回滚事务、删除
+#      临时文件（及未登记的落地文件），绝不留下已登记的损坏分片。
+# 固定的加锁顺序（ID 字典序）排除了 A→B 与 B→A 反向并发时的循环等待。
+# ---------------------------------------------------------------------------
+
+
+def _copy_chunk(
+    target_session_id: str,
+    source_session_id: str,
+    source_start: int,
+    source_end: int,
+    target_start: int,
+) -> dict:
+    length = source_end - source_start
+    target_end = target_start + length
+
+    with session_locks.hold(source_session_id, target_session_id):
+        # 目标：与 PUT 分片相同的存在性/懒过期加载。
+        target = _load_session(target_session_id)
+        if target["status"] == "completed":
+            raise _http(409, "session already completed; no more chunks accepted")
+
+        # 来源：只允许已完成且成品在盘的会话；未完成/成品缺失一律拒绝。
+        conn = db.get_conn()
+        source = conn.execute(
+            "SELECT * FROM upload_sessions WHERE id = ?", (source_session_id,)
+        ).fetchone()
+        if source is None:
+            raise _http(
+                404, "source session not found",
+                source_session_id=source_session_id,
+            )
+        if source["status"] != "completed":
+            raise _http(
+                409,
+                "source session is not completed",
+                source_session_id=source_session_id,
+                source_status=source["status"],
+            )
+        if not storage.artifact_path(source_session_id).is_file():
+            raise _http(
+                409,
+                "source completed artifact is missing",
+                source_session_id=source_session_id,
+            )
+
+        # 来源半开区间必须完整落在来源成品大小内。
+        if source_end > source["total_size"]:
+            raise _http(
+                400,
+                "source range exceeds source total_size",
+                source_start=source_start,
+                source_end=source_end,
+                source_total_size=source["total_size"],
+            )
+
+        # 目标边界：[target_start, target_end) 不越界。
+        if target_end > target["total_size"]:
+            raise _http(
+                400,
+                "copied chunk range exceeds target total_size",
+                start=target_start,
+                end=target_end,
+                total_size=target["total_size"],
+            )
+        # 单片大小限制与 PUT 分片一致。
+        if settings.max_chunk_bytes and length > settings.max_chunk_bytes:
+            raise _http(
+                413,
+                "chunk larger than MAX_CHUNK_BYTES",
+                max_chunk_bytes=settings.max_chunk_bytes,
+            )
+        # 与目标已收区间不得重叠（相邻允许）。
+        existing = [
+            (r["start_offset"], r["end_offset"])
+            for r in conn.execute(
+                "SELECT start_offset, end_offset FROM chunks "
+                "WHERE session_id = ?",
+                (target_session_id,),
+            ).fetchall()
+        ]
+        if storage.overlaps_any(target_start, target_end, existing):
+            raise _http(
+                409,
+                "chunk overlaps an already received range",
+                start=target_start,
+                end=target_end,
+            )
+
+        # 预校验全部通过才复制（仍在双锁内）：流式切片到 tmp，
+        # 成品被并发截断/替换会在此抛错，临时文件由辅助函数自行清理。
+        try:
+            tmp_file = storage.copy_artifact_segment(
+                source_session_id, source_start, source_end
+            )
+        except (ValueError, OSError) as exc:
+            raise _http(
+                409,
+                f"cannot copy source artifact segment: {exc}",
+                source_session_id=source_session_id,
+            ) from exc
+        tmp_path = Path(tmp_file)
+        final = storage.part_path(target_session_id, target_start, target_end)
+
+        # 单事务二次校验 + 落盘 + 登记：与 _commit_chunk 同一原子性保证。
+        # 失败清理必须仍在双锁内完成：否则刚 replace 落地、事务却回滚的
+        # part 文件可能与并发 PUT 同路径竞争，误删别人刚登记的分片。
+        try:
+            with db.immediate() as tx:
+                trow = tx.execute(
+                    "SELECT * FROM upload_sessions WHERE id = ?",
+                    (target_session_id,),
+                ).fetchone()
+                if trow is None:
+                    raise _http(404, "session not found")
+                if trow["status"] in ("aborted", "expired") or (
+                    trow["status"] == "uploading"
+                    and storage.parse_iso(trow["expires_at"]) <= storage.utcnow()
+                ):
+                    raise _http(410, "session no longer active")
+                if trow["status"] == "completed":
+                    raise _http(409, "session already completed")
+                if target_end > trow["total_size"]:
+                    raise _http(400, "chunk range exceeds total_size")
+
+                if storage.overlaps_any(
+                    target_start, target_end, _existing_intervals(tx, target_session_id)
+                ):
+                    raise _http(
+                        409,
+                        "chunk overlaps an already received range",
+                        start=target_start,
+                        end=target_end,
+                    )
+
+                # 来源资格在事务内复查：来源若已被并发放弃删除，此处拿到
+                # 状态变化/成品缺失，事务回滚，不登记任何分片。
+                srow = tx.execute(
+                    "SELECT status, total_size FROM upload_sessions WHERE id = ?",
+                    (source_session_id,),
+                ).fetchone()
+                if srow is None or srow["status"] != "completed":
+                    raise _http(
+                        409,
+                        "source session is not completed",
+                        source_session_id=source_session_id,
+                    )
+                if source_end > srow["total_size"]:
+                    raise _http(400, "source range exceeds source total_size")
+                if not storage.artifact_path(source_session_id).is_file():
+                    raise _http(
+                        409,
+                        "source completed artifact is missing",
+                        source_session_id=source_session_id,
+                    )
+
+                # 事务内移动文件：后续任一 SQL 失败都会回滚并由 except 删除文件。
+                final.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path.replace(final)
+
+                now = storage.utcnow()
+                now_iso = storage.iso(now)
+                expires_iso = storage.iso(
+                    now + timedelta(seconds=settings.ttl_seconds)
+                )
+                tx.execute(
+                    "INSERT INTO chunks "
+                    "(session_id, start_offset, end_offset, size, received_at) "
+                    "VALUES (?, ?, ?, ?, ?)",
+                    (target_session_id, target_start, target_end, length, now_iso),
+                )
+                tx.execute(
+                    "UPDATE upload_sessions "
+                    "SET bytes_received = bytes_received + ?, "
+                    "last_access_at = ?, expires_at = ? WHERE id = ?",
+                    (length, now_iso, expires_iso, target_session_id),
+                )
+        except BaseException:
+            # 仍持有两把会话锁：临时文件与可能已 replace 但未登记的落地
+            # 文件一并删除，绝不留下已登记/半登记的损坏分片。
+            tmp_path.unlink(missing_ok=True)
+            final.unlink(missing_ok=True)
+            raise
+
+        return _chunk_accepted_payload(target_session_id, target_start, target_end)
+
+
+@app.post(
+    "/api/v1/sessions/{session_id}/copy-chunk",
+    response_model=schemas.ChunkResponse,
+    tags=["chunks"],
+)
+def copy_chunk(session_id: str, body: schemas.CopyChunkRequest) -> dict:
+    """从已完成来源会话的成品服务端复制一段，登记为本会话的一个分片。"""
+    if body.source_session_id == session_id:
+        raise _http(
+            400,
+            "source and target session must differ",
+            source_session_id=body.source_session_id,
+        )
+    return _copy_chunk(
+        target_session_id=session_id,
+        source_session_id=body.source_session_id,
+        source_start=body.source_start,
+        source_end=body.source_end,
+        target_start=body.target_start,
+    )
 
 
 # ---------------------------------------------------------------------------

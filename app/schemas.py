@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import re
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from . import settings
 
@@ -86,6 +86,25 @@ class ChunkResponse(BaseModel):
     missing_ranges: list[MissingRange]
     fully_received: bool
     expires_at: str
+
+
+class CopyChunkRequest(BaseModel):
+    """服务端复制分片请求：从已完成来源会话的成品中复制一段。"""
+
+    source_session_id: str = Field(
+        ..., min_length=1, max_length=128, description="已完成的来源会话 ID"
+    )
+    source_start: int = Field(..., ge=0, description="来源起始偏移（含）")
+    source_end: int = Field(..., ge=0, description="来源结束偏移（不含），半开区间")
+    target_start: int = Field(
+        ..., ge=0, description="目标会话中的起始偏移（含），长度沿用来源区间"
+    )
+
+    @model_validator(mode="after")
+    def _validate_range(self) -> "CopyChunkRequest":
+        if self.source_end <= self.source_start:
+            raise ValueError("invalid source range: require source_start < source_end")
+        return self
 
 
 # ---------------------------------------------------------------------------

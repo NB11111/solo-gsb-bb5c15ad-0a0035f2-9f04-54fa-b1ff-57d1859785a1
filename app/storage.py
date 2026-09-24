@@ -199,3 +199,46 @@ def assemble_artifact(
 def atomic_publish(tmp_file: str, session_id: str) -> None:
     """把拼装好的临时文件原子替换为成品文件。"""
     os.replace(tmp_file, artifact_path(session_id))
+
+
+# ---------------------------------------------------------------------------
+# 跨会话复制：从已完成会话的成品中切出一段，流式写入临时文件
+# ---------------------------------------------------------------------------
+
+
+def copy_artifact_segment(
+    source_session_id: str,
+    start: int,
+    end: int,
+) -> str:
+    """把成品文件的 [start, end) 字节流式复制为 tmp 下的新临时文件。
+
+    仅读取已完成会话的成品（files/<id>），不接触分片目录。
+    返回临时文件路径；读取前核对区间落在文件大小内，读完核对字节数，
+    成品被并发截断/替换会在此暴露为 OSError/ValueError，绝不产生短文件。
+    任何失败都清理刚创建的临时文件。
+    """
+    src = artifact_path(source_session_id)
+    length = end - start
+    tmp_out = new_temp_file()
+    try:
+        with tmp_out.open("wb") as out, src.open("rb") as fh:
+            actual_size = fh.seek(0, os.SEEK_END)
+            if end > actual_size:
+                raise ValueError(
+                    f"source range [{start},{end}) exceeds artifact size {actual_size}"
+                )
+            fh.seek(start)
+            remaining = length
+            while remaining > 0:
+                block = fh.read(min(1024 * 1024, remaining))
+                if not block:
+                    raise ValueError(
+                        f"source artifact ended at {length - remaining} of {length} bytes"
+                    )
+                out.write(block)
+                remaining -= len(block)
+    except BaseException:
+        tmp_out.unlink(missing_ok=True)
+        raise
+    return str(tmp_out)
